@@ -1,0 +1,8 @@
+langchain
+openai
+faiss-cpu
+numpy
+Pillow
+streamlit
+python-dotenv
+langchain-community
