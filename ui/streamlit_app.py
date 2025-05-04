@@ -1,7 +1,10 @@
+# ui/streamlit_app.py
 import os
 import sys
 import streamlit as st
 from PIL import Image
+import requests
+from io import BytesIO
 
 # Add parent directory to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -19,7 +22,7 @@ def create_streamlit_app():
     # Setup sidebar for configuration
     st.sidebar.header("Configuration")
     openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-    image_folder = st.sidebar.text_input("Image Folder Path", value="./images")
+    serpapi_key = st.sidebar.text_input("SerpAPI Key", type="password")
     
     # Main content area
     st.header("Search for Images")
@@ -49,37 +52,49 @@ def create_streamlit_app():
     
     # Cache the pipeline to avoid reinitializing on every search
     @st.cache_resource
-    def get_pipeline(api_key, folder):
-        return ImageSearchPipeline(api_key, folder)
+    def get_pipeline(openai_key, serp_key):
+        return ImageSearchPipeline(openai_key, serp_key)
     
     # Initialize and run search when button is clicked
-    if search_button and openai_api_key and image_folder and description:
+    if search_button and openai_api_key and serpapi_key and description:
         try:
-            # Validate inputs
-            if not os.path.exists(image_folder):
-                st.error(f"Image folder path does not exist: {image_folder}")
-                return
-                
-            with st.spinner("Initializing pipeline and searching for images..."):
-                pipeline = get_pipeline(openai_api_key, image_folder)
+            with st.spinner("Searching for images that match your description..."):
+                pipeline = get_pipeline(openai_api_key, serpapi_key)
                 results = pipeline.search(description, top_k=top_k)
             
             # Display results
             if results:
                 st.header("Search Results")
                 for i, result in enumerate(results):
-                    col1, col2 = st.columns([1, 2])
-                    with col1:
-                        try:
-                            image = Image.open(result.path)
-                            st.image(image, caption=f"Match Score: {result.match_score:.2f}")
-                        except Exception as e:
-                            st.error(f"Error loading image: {e}")
-                    with col2:
-                        st.subheader(f"Result #{i+1}")
-                        st.write(f"Filename: {result.filename}")
-                        st.write(f"Match Score: {result.match_score:.2f}")
-                        st.write(f"Vector Similarity: {result.similarity:.2f}")
+                    with st.container():
+                        st.subheader(f"Result #{i+1} - Match Score: {result.match_score:.2f}")
+                        
+                        cols = st.columns([2, 3])
+                        with cols[0]:
+                            # Display image - prefer local path if available, else use URL
+                            try:
+                                if result.local_path:
+                                    image = Image.open(result.local_path)
+                                    st.image(image, caption=f"Match Score: {result.match_score:.2f}")
+                                else:
+                                    st.image(result.url, caption=f"Match Score: {result.match_score:.2f}")
+                            except Exception as e:
+                                st.error(f"Error displaying image: {e}")
+                                st.image(result.thumbnail, caption="Thumbnail")
+                        
+                        with cols[1]:
+                            st.write(f"**Title:** {result.title}")
+                            st.write(f"**Source:** [Visit Page]({result.source_page})")
+                            st.write(f"**Dimensions:** {result.width}x{result.height}")
+                            st.write(f"**Match Score:** {result.match_score:.2f}")
+                            st.write(f"**Image URL:** [Open Image]({result.url})")
+                            if result.element_scores:
+                                st.write("**Element Scores:**")
+                                for element, score in result.element_scores.items():
+                                    status = "✅" if score >= 5 else "❌"
+                                    st.write(f"  {status} {element}: {score:.1f}/10")
+                            
+                        st.markdown("---")
             else:
                 st.warning("No matching images found.")
         except Exception as e:

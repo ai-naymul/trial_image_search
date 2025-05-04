@@ -1,3 +1,4 @@
+# src/config/settings.py
 import os
 from typing import Dict, Any
 from dotenv import load_dotenv
@@ -8,7 +9,7 @@ load_dotenv()
 # Default configuration
 DEFAULT_CONFIG = {
     "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-    "images_directory": os.getenv("IMAGES_DIRECTORY", "./images"),
+    "serpapi_key": os.getenv("SERPAPI_KEY", ""),
     "text_model": "gpt-4",
     "vision_model": "gpt-4o",
     "max_tokens": 1024,
@@ -26,7 +27,7 @@ def validate_config(config: Dict[str, Any]) -> bool:
     if not config.get("openai_api_key"):
         return False
     
-    if not os.path.exists(config.get("images_directory", "")):
+    if not config.get("serpapi_key"):
         return False
     
     return True

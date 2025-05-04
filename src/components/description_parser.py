@@ -71,25 +71,45 @@ class DescriptionParser:
                 "action": "unknown"
             }
     
-    def generate_search_queries(self, description_components: Dict[str, Any]) -> List[str]:
-        """Generate search queries from description components"""
+    def generate_search_queries(self, description_components: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate structured search queries from description components"""
+        # Sort elements by importance
+        sorted_elements = sorted(
+            description_components["elements"], 
+            key=lambda x: x.get("importance", 0),
+            reverse=True
+        )
+        
+        # Generate combinations of essential elements
+        core_elements = [elem["element"] for elem in sorted_elements[:3]]  # Take top 3 elements
+        
         queries = []
         
-        # Add all elements as individual queries
-        for comp in description_components["elements"]:
-            queries.append(comp["element"])
+        # First query: all key elements in one search
+        all_elements_query = " ".join(core_elements)
+        queries.append({
+            "query": all_elements_query,
+            "weight": 1.0,
+            "elements": core_elements
+        })
         
-        # Add subjects as a combined query
-        if description_components.get("subjects"):
-            queries.append(" ".join(description_components["subjects"]))
+        # Generate more specific queries with essential combinations
+        for i, elem1 in enumerate(core_elements):
+            for j, elem2 in enumerate(core_elements[i+1:], i+1):
+                if i != j:
+                    query = f"{elem1} {elem2}"
+                    queries.append({
+                        "query": query,
+                        "weight": 0.7,
+                        "elements": [elem1, elem2]
+                    })
         
-        # Add setting and action if available
-        setting = description_components.get("setting")
-        if setting and setting != "unknown":
-            queries.append(setting)
-        
-        action = description_components.get("action")
-        if action and action != "unknown":
-            queries.append(action)
-        
+        # Add individual essential elements
+        for i, elem in enumerate(core_elements):
+            queries.append({
+                "query": elem,
+                "weight": 0.5,
+                "elements": [elem]
+            })
+        print("Here is the query:", queries)
         return queries

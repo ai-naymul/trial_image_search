@@ -1,3 +1,4 @@
+# main.py
 import os
 import sys
 import argparse
@@ -25,14 +26,14 @@ def main():
         help="Detailed image description to search for"
     )
     parser.add_argument(
-        "--images", "-i", 
-        default=os.getenv("IMAGES_DIRECTORY", "./images"),
-        help="Directory containing images to search"
-    )
-    parser.add_argument(
-        "--api-key", "-k", 
+        "--openai-key", "-ok", 
         default=os.getenv("OPENAI_API_KEY", ""),
         help="OpenAI API key"
+    )
+    parser.add_argument(
+        "--serpapi-key", "-sk", 
+        default=os.getenv("SERPAPI_KEY", ""),
+        help="SerpAPI key"
     )
     parser.add_argument(
         "--results", "-r", 
@@ -44,17 +45,17 @@ def main():
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.api_key:
+    if not args.openai_key:
         print("Error: OpenAI API key is required")
         return 1
     
-    if not os.path.exists(args.images):
-        print(f"Error: Image directory not found: {args.images}")
+    if not args.serpapi_key:
+        print("Error: SerpAPI key is required")
         return 1
     
     # Initialize the pipeline
     try:
-        pipeline = ImageSearchPipeline(args.api_key, args.images)
+        pipeline = ImageSearchPipeline(args.openai_key, args.serpapi_key)
         
         # Search for images
         results = pipeline.search(args.description, top_k=args.results)
@@ -69,10 +70,11 @@ def main():
         
         for i, result in enumerate(results, 1):
             print(f"\nResult #{i}")
-            print(f"Filename: {result.filename}")
-            print(f"Path: {result.path}")
+            print(f"Title: {result.title}")
             print(f"Match Score: {result.match_score:.2f}")
-            print(f"Similarity: {result.similarity:.2f}")
+            print(f"Source: {result.source_page}")
+            print(f"Image URL: {result.url}")
+            print(f"Dimensions: {result.width}x{result.height}")
         
         return 0
         
