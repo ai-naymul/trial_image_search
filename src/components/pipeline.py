@@ -5,9 +5,15 @@ import requests
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from PIL import Image
+import json
+import os
+import time
+import concurrent.futures
+from functools import lru_cache
 
-from langchain_community.chat_models import ChatOpenAI
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain.chains.llm import LLMChain
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
 from src.components.image_analyzer import ImageAnalyzer
 from src.components.description_parser import DescriptionParser
@@ -151,202 +157,251 @@ class ImageSearchPipeline:
             
         return False
         
-    # Cache for API responses to avoid duplicate calls
-    _api_response_cache = {}
+    # Class-level cache for API responses to avoid duplicate calls across searches
+    _global_cache = {}
+    
+    @staticmethod
+    @lru_cache(maxsize=100)
+    def _cached_api_call(func_name, key, *args, **kwargs):
+        """Generic caching wrapper for expensive API calls"""
+        cache_key = f"{func_name}_{key}"
+        if cache_key in ImageSearchPipeline._global_cache:
+            logger.debug(f"Cache hit for {cache_key}")
+            return ImageSearchPipeline._global_cache[cache_key]
+        
+        start_time = time.time()
+        result = args[0](*args[1:], **kwargs)  # args[0] is the function to call
+        end_time = time.time()
+        logger.debug(f"API call to {func_name} took {end_time - start_time:.2f} seconds")
+        
+        ImageSearchPipeline._global_cache[cache_key] = result
+        return result
     
     def search(self, description: str, top_k: int = 5) -> List[SearchResult]:
-        """Search for images matching the given description"""
-        
-        # Clear cache for new search
-        self._api_response_cache = {}
-        
-        logger.info(f"Searching for images matching: {description}")
+        """
+        Fast search for images matching the given description
+        Optimized for speed (10-15 second response time)
+        """
+        start_time = time.time()
+        logger.info(f"Starting fast search for: {description}")
         
         try:
-            # Step 1: Break down description into components
-            logger.info("Breaking down description into components...")
-            description_components = self.description_parser.break_down_description(description)
-            
-            # Step 2: Generate structured search queries
-            logger.info("Generating search queries...")
-            search_queries = self.description_parser.generate_search_queries(description_components)
-            
-            # Step 3: Perform image searches for each query
-            logger.info("Performing image searches...")
-            all_images = {}  # Dict to deduplicate images by URL
-            
-            # Limit the number of queries to reduce API calls
-            # Use only the highest weighted queries
-            search_queries.sort(key=lambda x: x["weight"], reverse=True)
-            top_queries = search_queries[:min(3, len(search_queries))]
-            
-            for query_data in top_queries:
-                query = query_data["query"]
-                query_weight = query_data["weight"]
-                query_elements = query_data["elements"]
-                
-                logger.info(f"Searching for images with query: {query}")
-                try:
-                    # Reduced number of results to just what we need (5-8 per query)
-                    results = self.image_search.search_images(query, num_results=6)
-                    
-                    for image_data in results:
-                        image_url = image_data["url"]
-                        # Skip if we've already seen this image
-                        if image_url in all_images:
-                            continue
-                            
-                        # Store image with its query context
-                        image_data["query"] = query
-                        image_data["query_weight"] = query_weight
-                        image_data["query_elements"] = query_elements
-                        all_images[image_url] = image_data
-                except Exception as e:
-                    logger.error(f"Error searching with query '{query}': {e}")
-                    continue
-            
-            logger.info(f"Found {len(all_images)} unique images from searches")
-            
-            # Early return if no images found
-            if not all_images:
-                return []
-            
-            # Step 4: Pre-filter by checking for essential elements
-            logger.info("Pre-filtering images for essential elements...")
-            essential_elements = []
-            for comp in description_components["elements"]:
-                if comp.get("importance", 0) >= 7:  # Consider high importance elements as essential
-                    essential_elements.append(comp["element"])
-            
-            # Limit to essential elements if we have too many
-            if len(essential_elements) > 3:
-                essential_elements = essential_elements[:3]
-            
-            # If we don't have enough, add more from the subjects
-            if len(essential_elements) < 2 and description_components.get("subjects"):
-                for subj in description_components["subjects"]:
-                    if subj not in essential_elements:
-                        essential_elements.append(subj)
-                        if len(essential_elements) >= 2:
-                            break
-            
-            # Process only a limited number of images to check for essential elements
-            # Sort the URLs by relevance based on the search query
-            sorted_urls = sorted(
-                all_images.keys(),
-                key=lambda url: all_images[url]["query_weight"], 
-                reverse=True
+            # Step 1: Break down description into components (cached)
+            logger.info("Breaking down description...")
+            description_components = self._cached_api_call(
+                "break_down_description", 
+                description,
+                self.description_parser.break_down_description, 
+                description
             )
             
-            # Take only the top images to process (2-3 per query)
-            top_urls = sorted_urls[:min(10, len(sorted_urls))]
+            # Step 2: Create a simplified query for faster results
+            main_elements = []
+            # Get the most important elements
+            for comp in description_components["elements"]:
+                if comp.get("importance", 0) >= 6:  # Lower threshold to get more elements
+                    main_elements.append(comp["element"])
             
-            skipped_urls = []
-            for url in top_urls:
-                try:
-                    # Check if we've already processed this URL (use cache)
-                    cache_key = f"element_presence_{url}_{','.join(essential_elements)}"
-                    if cache_key in self._api_response_cache:
-                        element_scores = self._api_response_cache[cache_key]
-                    else:
-                        # Check for presence of essential elements
-                        element_scores = self.image_analyzer.check_elements_presence(
-                            url, essential_elements, is_url=True
-                        )
-                        # Cache the result
-                        self._api_response_cache[cache_key] = element_scores
-                    
-                    # If we got back empty scores, skip this image
-                    if not element_scores:
-                        logger.info(f"No element scores returned for {url}, skipping")
-                        skipped_urls.append(url)
+            # Add main subjects if we have space
+            if len(main_elements) < 2 and description_components.get("subjects"):
+                main_elements.extend(description_components["subjects"][:2])
+                
+            # Create a simplified query
+            simplified_query = " ".join(main_elements)
+            if description_components.get("setting"):
+                simplified_query += f" {description_components['setting']}"
+                
+            logger.info(f"Using simplified query: {simplified_query}")
+            
+            # Step 3: Perform parallel image search and initial filtering
+            all_images = {}  # Dict to deduplicate images by URL
+            
+            # Perform the initial image search
+            try:
+                logger.info(f"Searching for images...")
+                results = self.image_search.search_images(simplified_query, num_results=12)
+                
+                # Filter results to only include promising candidates (fast filtering only)
+                for image_data in results:
+                    image_url = image_data["url"]
+                    # Only include if it has a valid format and reasonable size
+                    if not self._is_likely_image_url(image_url):
                         continue
+                    all_images[image_url] = image_data
+                    
+                    # Limit to top 8 images for speed
+                    if len(all_images) >= 8:
+                        break
                         
-                    # Store element scores
-                    all_images[url]["element_scores"] = element_scores
-                    
-                    # Calculate preliminary score based on element presence
-                    present_elements = sum(1 for score in element_scores.values() if score >= 5)
-                    all_images[url]["preliminary_score"] = present_elements / max(1, len(essential_elements))
-                except Exception as e:
-                    logger.error(f"Error processing URL {url}: {e}")
-                    skipped_urls.append(url)
-            
-            # Remove skipped URLs from all_images
-            for url in skipped_urls:
-                if url in all_images:
-                    del all_images[url]
-                    
-            # If we have too few images after filtering, we'll proceed with what we have
+            except Exception as e:
+                logger.error(f"Error in image search: {e}")
+                
+            # Early return if no images found
             if not all_images:
-                logger.warning("No valid images remained after filtering")
+                logger.warning("No images found")
                 return []
+                
+            logger.info(f"Found {len(all_images)} candidate images")
             
-            # Sort by preliminary score and select a very limited set of top candidates for detailed evaluation
-            # This significantly reduces API calls
+            # Step 4: Parallel processing of images for speed
+            # Process images in parallel to save time
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # Define a function to process a single image
+                def process_image(url):
+                    try:
+                        # Fast check - can we download this image quickly?
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        }
+                        response = requests.head(url, headers=headers, timeout=3)
+                        
+                        # Skip if not a valid image or too large
+                        content_type = response.headers.get('content-type', '').lower()
+                        if not any(img_type in content_type for img_type in ['image/jpeg', 'image/png', 'image/webp']):
+                            return url, None
+                        
+                        # Check for presence of main elements
+                        # We use a smaller set of elements for faster processing
+                        check_elements = main_elements[:2] if main_elements else [description_components.get("subjects", [""])[0]]
+                        
+                        element_scores = self.image_analyzer.check_elements_presence(
+                            url, check_elements, is_url=True
+                        )
+                        
+                        if not element_scores:
+                            return url, None
+                            
+                        # Calculate preliminary score 
+                        present_elements = sum(1 for score in element_scores.values() if score >= 5)
+                        preliminary_score = present_elements / max(1, len(check_elements))
+                        
+                        # Return results
+                        return url, {
+                            "element_scores": element_scores,
+                            "preliminary_score": preliminary_score
+                        }
+                    except Exception as e:
+                        logger.error(f"Error processing {url}: {e}")
+                        return url, None
+                
+                # Submit all URLs for parallel processing
+                future_to_url = {executor.submit(process_image, url): url for url in all_images.keys()}
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        url, result = future.result()
+                        if result:
+                            all_images[url].update(result)
+                        else:
+                            # Remove this URL if processing failed
+                            all_images.pop(url, None)
+                    except Exception as e:
+                        logger.error(f"Error getting result for {url}: {e}")
+                        all_images.pop(url, None)
+            
+            # Check if we have any valid images left
+            if not all_images:
+                logger.warning("No valid images after processing")
+                return []
+                
+            # Sort by preliminary score
             candidates = sorted(
                 all_images.values(), 
                 key=lambda x: x.get("preliminary_score", 0),
                 reverse=True
-            )[:min(top_k+1, len(all_images))]  # Just top_k+1 to ensure we have enough after filtering
+            )[:min(top_k, len(all_images))]
             
-            # Step 5: Full evaluation for top candidates
-            logger.info("Performing detailed evaluation on top candidates...")
+            # Step 5: Fast evaluation
+            logger.info("Fast evaluation of top candidates...")
             final_results = []
             
-            for image_data in candidates:
-                try:
-                    url = image_data["url"]
-                    
-                    # Check cache first
-                    cache_key = f"match_score_{url}_{description}"
-                    if cache_key in self._api_response_cache:
-                        match_score = self._api_response_cache[cache_key]
-                    else:
-                        # Perform full evaluation
-                        match_score = self.image_analyzer.evaluate_match(
-                            url,
-                            description_components,
-                            is_url=True
+            # Process in parallel for speed
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                def evaluate_image(img_data):
+                    try:
+                        url = img_data["url"]
+                        # Since we're optimizing for speed, skip full evaluation
+                        # and use preliminary score directly
+                        match_score = img_data.get("preliminary_score", 0.5)
+                        
+                        # For top few images, do a more detailed check if time allows
+                        if len(final_results) < 3 and time.time() - start_time < 12:
+                            try:
+                                detailed_score = self.image_analyzer.evaluate_match(
+                                    url, description_components, is_url=True
+                                )
+                                # Blend with preliminary score
+                                match_score = 0.6 * detailed_score + 0.4 * match_score
+                            except Exception as eval_err:
+                                logger.warning(f"Detailed evaluation failed: {eval_err}")
+                                # Continue with preliminary score only
+                        
+                        return SearchResult(
+                            title=img_data.get("title", "Untitled Image"),
+                            url=url,
+                            source_page=img_data.get("source_page", ""),
+                            thumbnail=img_data.get("thumbnail", ""),
+                            match_score=match_score,
+                            width=img_data.get("width", 0),
+                            height=img_data.get("height", 0),
+                            element_scores=img_data.get("element_scores", {})
                         )
-                        # Cache the result
-                        self._api_response_cache[cache_key] = match_score
-                    
-                    # Blend with preliminary score for a more balanced result
-                    final_score = 0.7 * match_score + 0.3 * image_data.get("preliminary_score", 0)
-                    
-                    result = SearchResult(
-                        title=image_data["title"] or "Untitled Image",
-                        url=image_data["url"],
-                        source_page=image_data.get("source_page", ""),
-                        thumbnail=image_data.get("thumbnail", ""),
-                        match_score=final_score,
-                        width=image_data.get("width", 0),
-                        height=image_data.get("height", 0),
-                        element_scores=image_data.get("element_scores", {})
-                    )
-                    
-                    final_results.append(result)
-                except Exception as e:
-                    logger.error(f"Error evaluating image {image_data.get('url', 'unknown')}: {e}")
-                    continue
+                    except Exception as e:
+                        logger.error(f"Error evaluating {url}: {e}")
+                        return None
+                
+                # Submit all candidates for parallel evaluation
+                futures = [executor.submit(evaluate_image, img_data) for img_data in candidates]
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result:
+                            final_results.append(result)
+                    except Exception as e:
+                        logger.error(f"Error in evaluation: {e}")
             
             # Sort by match score
             final_results.sort(key=lambda x: x.match_score, reverse=True)
             
-            # Try to download images for top results
-            for i, result in enumerate(final_results[:top_k]):
-                try:
-                    local_path = self.download_image(result.url)
-                    if local_path:
-                        final_results[i].local_path = local_path
-                except Exception as e:
-                    logger.error(f"Error downloading image {result.url}: {e}")
+            # Try to download images for top results if time permits
+            elapsed_time = time.time() - start_time
+            if elapsed_time < 12:  # Only download if we have time
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    def download_top_image(result, index):
+                        try:
+                            local_path = self.download_image(result.url)
+                            return index, local_path
+                        except Exception as e:
+                            logger.error(f"Error downloading image: {e}")
+                            return index, None
+                    
+                    # Only try to download top few images
+                    futures = [executor.submit(download_top_image, result, i) 
+                              for i, result in enumerate(final_results[:min(3, len(final_results))])]
+                    
+                    # Update results with local paths
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            index, local_path = future.result()
+                            if local_path and index < len(final_results):
+                                final_results[index].local_path = local_path
+                        except Exception as e:
+                            logger.error(f"Error handling download result: {e}")
+            
+            # Final timing info
+            total_time = time.time() - start_time
+            logger.info(f"Search completed in {total_time:.2f} seconds")
             
             # Return top-k results
             return final_results[:top_k]
         except Exception as e:
             logger.error(f"Error in search pipeline: {e}")
+            elapsed_time = time.time() - start_time
+            logger.info(f"Search failed after {elapsed_time:.2f} seconds")
             return []
 
     def _batch_items(self, items, batch_size=5):
